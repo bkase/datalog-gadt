@@ -6,6 +6,18 @@ module Elem = struct
     | There : ('a, 's) t -> ('a, 'b -> 's) t
 end
 
+module V = struct
+  type 'a t =
+    { pprint : 'a -> string ; value : 'a }
+
+  let sym value : string t =
+    { pprint = Fn.id
+    ; value }
+  let num value : int64 t =
+    { pprint = (fun v -> Int64.to_string v)
+    ; value }
+end
+
 module Hlist = struct
   module Make (T : sig
     type 'a t
@@ -14,27 +26,77 @@ module Hlist = struct
       | [] : unit t
       | (::) : 'a T.t * 'b t -> ('a -> 'b) t
 
+    module Mapper = struct
+      type 'b t = {f: 'a. 'a T.t -> 'b}
+    end
+
+    let rec map : type a. a t -> 'b Mapper.t -> 'b List.t =
+      fun ls mapper ->
+        match ls with
+        | [] -> []
+        | h :: t -> List.cons (mapper.f h) (map t mapper)
+
     let rec get : type a x. a t -> (x, a) Elem.t -> x T.t =
       fun l elem ->
         match (l, elem) with
         | x :: _, Elem.Here -> x
         | _ :: xs, Elem.There e -> get xs e
         | _ -> .
+
+    let pprint : 'a t -> string Mapper.t -> string =
+      fun t mapper ->
+        let xs = map t mapper in
+        List.fold xs ~init:None ~f:(fun acc x ->
+          match acc with
+          | None -> Some x
+          | Some acc -> Some (acc ^ ", " ^ x)
+        ) |> Option.value ~default:""
   end
 
-  include Make(struct type 'a t = 'a end)
+  include Make(struct
+    type 'a t = 'a V.t
+  end)
+
+  let pprint : 'a t -> string =
+    fun t ->
+    let m : string Mapper.t =
+      let f : type a. a V.t -> string =
+        fun {pprint;value} -> pprint value
+      in
+      { Mapper.f }
+    in
+    pprint t m
 end
 
 module Prim = struct
-  type _ t =
-    | Int : int64 t
-    | Symbol : string t
+  module T = struct
+    type _ t =
+      | Int : int64 t
+      | Symbol : string t
 
-  module List = Hlist.Make(struct type nonrec 'a t = 'a t end)
+    let pprint : type a. a t -> string = function
+      | Int -> "Int"
+      | Symbol -> "Symbol"
+  end
+
+  include T
+  module List = struct
+    include Hlist.Make(T)
+    let pprint prims =
+      let m : string Mapper.t =
+        let f = T.pprint in
+        {Mapper.f}
+      in
+      pprint prims m
+  end
 end
 
 module Relation = struct
   type 'a t = string * 'a Prim.List.t
+
+  let pprint (name, prims) =
+    Printf.sprintf "rel %s(%s)" name
+      (Prim.List.pprint prims)
 
   module List = Hlist.Make(struct type nonrec 'a t = 'a t end)
 end
@@ -42,6 +104,9 @@ end
 module Fact = struct
   type 'a t =
     | Fact of 'a Relation.t * 'a Hlist.t
+
+  let pprint (Fact (rel, args)) =
+    Printf.sprintf "%s(%s)" (fst rel) (Hlist.pprint args)
 end
 
 module Free_bool_algebra = struct
@@ -50,6 +115,16 @@ module Free_bool_algebra = struct
     | Or of 'a t * 'a t
     | Not of 'a t
     | Pure of 'a
+
+  let rec pprint pprint_a t =
+    let f = pprint pprint_a in
+    match t with
+    | And (x, y) ->
+        "(" ^ (f x) ^ " && " ^ (f y) ^ ")"
+    | Or (x, y) ->
+        "(" ^ (f x) ^ " || " ^ (f y) ^ ")"
+    | Not x -> "(~" ^ f x ^ ")"
+    | Pure a -> pprint_a a
 
   let pure a = Pure a
 
@@ -67,16 +142,35 @@ module Free_bool_algebra = struct
 end
 
 module Rule = struct
-  module Self = struct
-    type 'a t = Self
-  end
   module Rule_term = struct
     type 'a t =
       | Self : 'a Hlist.t -> 'a t
       | Rel : 'a Relation.List.t * ('b, 'a) Elem.t * 'b Hlist.t -> 'b t
+
+    let pprint self_name t =
+      match t with
+      | Self args ->
+        Printf.sprintf "%s(%s)" self_name (Hlist.pprint args)
+      | Rel (rels, elem, args) ->
+        let rel = Relation.List.get rels elem in
+        Printf.sprintf "%s(%s)" (fst rel) (Hlist.pprint args)
   end
   type 'a t =
-    | T : string * 'a Relation.List.t * 'b Prim.List.t * 'c Rule_term.t Free_bool_algebra.t -> 'c t
+    | T : string * 'b Prim.List.t * 'b Hlist.t * 'c Rule_term.t Free_bool_algebra.t -> 'c t
+
+  let self args = Free_bool_algebra.pure (Rule_term.Self args)
+
+  let rel rels elem args =
+    Free_bool_algebra.pure (Rule_term.Rel (rels, elem, args))
+
+  let pprint = function
+    | T (name, prims, args, terms) ->
+      let open Rule_term in
+      Printf.sprintf "%s(%s):(%s) :- %s"
+        name
+        (Hlist.pprint args)
+        (Prim.List.pprint prims)
+        (Free_bool_algebra.pprint (Rule_term.pprint name) terms)
 end
 
 module Db = struct
@@ -105,37 +199,54 @@ module Db = struct
   include T
   include Monad.Make(T)
 
-  let intro_rel relation = Intro_rel (relation, return)
+  let intro_rel name typ = Intro_rel ((name, typ), return)
 
-  let intro_fact fact = Intro_fact (fact, return)
+  let intro_fact rel args = Intro_fact (Fact (rel, args), return)
 
-  let intro_rule rule = Intro_rule (rule, return)
+  let (-:) f x = f x
+
+  let intro_rule name typ args alg = Intro_rule (Rule.T (name, typ, args, alg), return)
+
+  let rec pprint t =
+    let f = pprint in
+    match t with
+    | Intro_rel (relation, k) ->
+        Relation.pprint relation ^ ".\n" ^ (f (k relation))
+    | Intro_fact (fact, k) ->
+        Fact.pprint fact ^ ".\n" ^ (f (k ()))
+    | Intro_rule (rule, k) ->
+        Rule.pprint rule ^ ".\n" ^ (f (k ()))
+    | Pure x -> ""
 end
 
 open Db
 open Relation
 open Fact
+open V
+
 let sample =
   let open Db.Let_syntax in
   let sxs = Prim.List.[Symbol;Symbol] in
-  let%bind node = intro_rel ("node", Prim.List.[Symbol]) in
-  let%bind edge = intro_rel ("edge", sxs) in
-  let%bind () = intro_fact (Fact (node, Hlist.["x"])) in
-  let%bind () = intro_fact (Fact (edge, Hlist.["x";"y"])) in
-  let%bind () = intro_fact (Fact (edge, Hlist.["y";"z"])) in
-  let%bind () = intro_fact (Fact (edge, Hlist.["z";"w"])) in
+  let%bind node = intro_rel "node" Prim.List.[Symbol] in
+  let%bind edge = intro_rel "edge" sxs in
+  let%bind () = intro_fact node Hlist.[sym "x"] in
+  let%bind () = intro_fact edge Hlist.[sym "x"; sym "y"] in
+  let%bind () = intro_fact edge Hlist.[sym "y"; sym "z"] in
+  let%bind () = intro_fact edge Hlist.[sym "z"; sym "w"] in
   let rels = Relation.List.[edge;node] in
-  let%map () = intro_rule
-    (Rule.T ("path", rels, sxs,
-      let open Free_bool_algebra in
-      let open Rule.Rule_term in
-      let path args = pure (Self args) in
-      let edge args = pure (Rel (rels, Elem.Here, args)) in
-      (edge (Hlist.["x"; "y"])) || (
-        (path Hlist.["x";"z"]) && (path Hlist.["z";"y"])
+  let%map () =
+    intro_rule "path" sxs Hlist.[sym "x";sym "y"] -: (
+        let open Rule in
+        let path = self in
+        let edge = rel rels Elem.Here in
+
+        let open Free_bool_algebra in
+        (edge (Hlist.[sym "x"; sym "y"])) || (
+          (path Hlist.[sym "x";sym "z"]) && (path Hlist.[sym "z"; sym "y"])
+        )
       )
-    ))
   in
   ()
 ;;
-printf "Hello world\n"
+
+printf "\n\n%s" (Db.pprint sample)
